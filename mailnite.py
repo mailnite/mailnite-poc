@@ -16,8 +16,18 @@ from ecdsa import SigningKey, SECP256k1
 from ecdsa.ecdh import ECDH
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+import rlp
+
 # Automatically adds this prefix to subject
 SUBJECT_PREFIX = "[Enc]"
+
+DEFAULT_BODY = """This email was encrypted by Mailnite.
+
+To decrypt, visit: https://mailnite.com/decrypt
+and upload attachment: mailnite.enc.
+
+If you are a developer, see: https://github.com/mailnite/concept"""
+
 
 # Generate a signing key using the SECP256k1 curve
 #eph_sk = SigningKey.generate(curve=SECP256k1)
@@ -159,15 +169,22 @@ def create(out, recipients, subject, body, attachments):
     click.echo(f"Plain email with attachments saved to {out}")
 
 
+
+import rlp
+
 @cli.command()
 @click.option("--in", "email_file", required=True, type=click.Path(exists=True), help="Plain email file")
 def encrypt(email_file):
-    """Encrypt the email for each recipient, outputting ECIES .eml files with encrypted attachment."""
+    """Encrypt the email for each recipient, outputting ECIES .eml files with an RLP envelope as attachment."""
     with open(email_file, "r") as f:
         email_txt = f.read()
 
-    # Use default policy for proper parsing, especially for attachments
     msg = email.message_from_string(email_txt, policy=policy.default)
+
+    if msg.get('X-Mailnite-Encrypted', '').lower() == "yes":
+        click.echo("This message already encrypted by Mailnite.")
+        return
+
     subject = msg.get('Subject', '')
     recipients = msg.get('To', '').split(',')
     recipients = [r.strip() for r in recipients if r.strip()]
@@ -196,38 +213,32 @@ def encrypt(email_file):
             aesgcm = AESGCM(aes_key)
             nonce = os.urandom(12)
             ct = aesgcm.encrypt(nonce, original_bytes, None)
-            ciphertext_b64 = b64u(ct)
 
-            # Automatically add [Nite] to Subject if not already present
+            # --- RLP ENVELOPE ---
+            envelope = [
+                1,  # version
+                "ecies-aesgcm",
+                compress_pubkey(eph_pk),
+                nonce,
+                ct,
+            ]
+            rlp_bytes = rlp.encode(envelope)
+
+            # Subject prefix
             subject_with_enc = subject if subject.strip().startswith(SUBJECT_PREFIX) else f"{SUBJECT_PREFIX} {subject}"
 
-            # Build new RFC822 message
+            # Build email with instructions and rlp attachment
             outmsg = EmailMessage()
             outmsg['To'] = rcpt
             outmsg['Subject'] = subject_with_enc
-            outmsg['X-ECIES-EphemeralPK'] = b64u(compress_pubkey(eph_pk))
-            outmsg['X-ECIES-Nonce'] = b64u(nonce)
-            outmsg['X-ECIES-Alg'] = "ecies-aesgcm"
-            outmsg['X-ECIES-Version'] = "1"
-
-            # Human-readable body
-            decrypt_url = "https://mailnite.com/decrypt"
-            outmsg.set_content(
-                f"This email was encrypted by Mailnite.\n\n"
-                f"To decrypt, visit: {decrypt_url}\n"
-                f"and upload this .eml file (with attachment: mailnite.enc).\n"
-                f"\nIf you are a developer, see: https://github.com/mailnite/concept\n"
-            )
-
-            # Add ciphertext as an attachment
+            outmsg['X-Mailnite-Encrypted'] = "yes"
+            outmsg.set_content(DEFAULT_BODY)
             outmsg.add_attachment(
-                ciphertext_b64.encode(),  # bytes
+                rlp_bytes,
                 maintype="application",
-                subtype="octet-stream",
+                subtype="x-mailnite-enc",
                 filename="mailnite.enc"
             )
-
-            # Optionally preserve original From/Date/Cc/etc.
             for header in ['From', 'Cc', 'Date', 'Reply-To']:
                 if msg.get(header):
                     outmsg[header] = msg.get(header)
@@ -241,15 +252,15 @@ def encrypt(email_file):
             click.echo(f"Error encrypting for {rcpt}: {e}")
 
 
-
 @cli.command()
 @click.option("--priv", required=True, help="Recipient's private key file")
 @click.option("--in", "infile", required=True, type=click.Path(exists=True), help="Input encrypted .eml file")
 @click.option("--out", required=True, help="Output file for decrypted plaintext email")
 def decrypt(priv, infile, out):
     """
-    Decrypt an ECIES-encrypted .eml message file (with ciphertext as attachment)
-    and write the original (fully restored) email to file.
+    Decrypt an ECIES-encrypted .eml message file (with RLP attachment)
+    and write the original (fully restored) email to file,
+    with SUBJECT_PREFIX removed from Subject if present.
     """
     with open(priv, "rb") as f:
         sk_bytes = f.read()
@@ -260,34 +271,28 @@ def decrypt(priv, infile, out):
 
     msg = email.message_from_string(raw_email, policy=policy.default)
 
-    # Extract cryptographic metadata from headers
-    eph_pk_b64 = msg['X-ECIES-EphemeralPK']
-    nonce_b64 = msg['X-ECIES-Nonce']
-    alg = msg['X-ECIES-Alg']
-    version = msg['X-ECIES-Version']
-
-    # Sanity checks
-    if not all([eph_pk_b64, nonce_b64, alg, version]):
-        click.echo("Missing ECIES headers, is this an encrypted message?")
+    if msg.get('X-Mailnite-Encrypted', '').lower() != "yes":
+        click.echo("Error: This message does not appear to be Mailnite-encrypted.")
         return
 
-    # --- Find the ciphertext attachment (filename == mailnite.enc) ---
-    ciphertext_b64 = None
+    # --- Find the RLP envelope as the first attachment (regardless of filename) ---
+    rlp_bytes = None
     for part in msg.iter_attachments():
-        filename = part.get_filename()
-        if filename and filename.lower() == "mailnite.enc":
-            ciphertext_b64 = part.get_content().strip()
-            break
-    if not ciphertext_b64:
-        click.echo("Error: No ciphertext attachment (mailnite.enc) found!")
+        payload = part.get_content()
+        if isinstance(payload, str):
+            rlp_bytes = payload.encode('latin1')
+        else:
+            rlp_bytes = payload
+        break  # Only use the first attachment found
+    if not rlp_bytes:
+        click.echo("Error: No RLP envelope attachment found!")
         return
 
-    eph_pk_bytes = b64u_decode(eph_pk_b64)
-    nonce = b64u_decode(nonce_b64)
-    ct = b64u_decode(ciphertext_b64)
+    # --- RLP DECODE ---
+    envelope = rlp.decode(rlp_bytes)
+    version, alg, eph_pk_bytes, nonce, ct = envelope
 
     # ECIES decryption
-    from ecdsa.ecdh import ECDH
     ecdh = ECDH(curve=SECP256k1, private_key=sk)
     ecdh.load_received_public_key_bytes(eph_pk_bytes)
     shared_secret = ecdh.generate_sharedsecret_bytes()
@@ -296,12 +301,20 @@ def decrypt(priv, infile, out):
     pt = aesgcm.decrypt(nonce, ct, None)
 
     # The decrypted payload is the full, original email (including all attachments)
-    # Write bytes (for non-UTF8 payloads, use wb if desired)
-    with open(out, "wb") as f:
-        f.write(pt)
+    # Remove SUBJECT_PREFIX from Subject if present
+    orig_msg = email.message_from_bytes(pt, policy=policy.default)
+    subject = orig_msg.get('Subject', '')
+
+    # Remove prefix if present (case sensitive, as you defined)
+    if subject.startswith(SUBJECT_PREFIX):
+        new_subject = subject[len(SUBJECT_PREFIX):].lstrip()
+        orig_msg.replace_header('Subject', new_subject)
+
+    # Save result (preserves all other headers and attachments)
+    with open(out, "w") as f:
+        f.write(orig_msg.as_string(policy=policy.default))
 
     click.echo(f"Decrypted email written to {out}")
-
 
 
 if __name__ == "__main__":

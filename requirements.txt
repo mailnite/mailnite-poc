@@ -2,3 +2,4 @@ click
 ecdsa
 cryptography
 dnspython
+rlp

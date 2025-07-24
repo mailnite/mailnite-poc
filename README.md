@@ -2,6 +2,7 @@
 
 Mailnite Proof of Concept
 
+Added header `X-Mailnite-Encrypted` that should be `yes` for encrypted emails by Mailnite.
 
 ## Example
 
