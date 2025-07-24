@@ -6,17 +6,22 @@ import json
 import re
 from datetime import datetime
 import dns.resolver
+import hashlib
 
 import email
 from email import policy
 from email.message import EmailMessage
 import mimetypes
 
-from ecdsa import SigningKey, SECP256k1
+from ecdsa import SigningKey, VerifyingKey, SECP256k1
 from ecdsa.ecdh import ECDH
+from ecdsa.util import sigencode_string
+from ecdsa.util import sigdecode_string
+
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 import rlp
+
 
 # Automatically adds this prefix to subject
 SUBJECT_PREFIX = "[Enc]"
@@ -160,7 +165,9 @@ def create(out, recipients, subject, body, attachments):
 
 @cli.command()
 @click.option("--in", "email_file", required=True, type=click.Path(exists=True), help="Plain email file")
-def encrypt(email_file):
+@click.option("--sender-priv", type=click.Path(exists=True), help="Sender signing private key (secp256k1). Optional.")
+@click.option("--sender-alg", default="secp256k1", show_default=True, help="Sender signing key algorithm to embed.")
+def encrypt(email_file, sender_priv, sender_alg):
     """Encrypt the email for each recipient, outputting ECIES .eml files with an RLP envelope as attachment."""
     with open(email_file, "r") as f:
         email_txt = f.read()
@@ -181,54 +188,93 @@ def encrypt(email_file):
     # Serialize the entire original email (headers + all MIME parts)
     original_bytes = msg.as_bytes(policy=policy.default)
 
+    # If we will sign, load sender key once
+    sender_sk = None
+    sender_pk_bytes = b""
+    sender_sig_bytes = b""
+    sender_alg_bytes = b""
+
+    if sender_priv:
+        with open(sender_priv, "rb") as f:
+            sender_sk_bytes = f.read()
+        sender_sk = SigningKey.from_string(sender_sk_bytes, curve=SECP256k1)
+        sender_vk = sender_sk.get_verifying_key()
+        sender_pk_bytes = compress_pubkey(sender_vk)           # compressed 33-byte SEC1
+        sender_alg_bytes = sender_alg.encode()
+
     for rcpt in recipients:
         rec = lookup_pubkey(rcpt)
         if rec is None:
             click.echo(f"Warning: No DNS public key record found for {rcpt}. Skipping this recipient.")
             continue
-        alg = rec.get("alg")
+
+        alg = rec.get("alg", "secp256k1")
         if alg != "secp256k1":
-            click.echo(f"Warning: Unsupported ECIES algorithm '{alg}' in {rcpt}. Skipping this recipient.")
+            click.echo(f"Warning: Unsupported ECIES algorithm '{alg}' for {rcpt}. Skipping.")
             continue
+
         enc = rec.get("enc", "aes256gcm")
         if enc != "aes256gcm":
-            click.echo(f"Warning: Unsupported encryption algorithm '{enc}' in {rcpt}. Skipping this recipient.")
+            click.echo(f"Warning: Unsupported encryption algorithm '{enc}' for {rcpt}. Skipping.")
             continue
-        usr = rec.get("usr")
-        key_id = rec.get("id")
-        iss = rec.get("iss")
+
+        usr = rec.get("usr") or ""
+        key_id = rec.get("id") or ""
+        iss = rec.get("iss") or ""
+
         try:
             recipient_pk_bytes = base64.urlsafe_b64decode(rec['pk'] + '=' * (-len(rec['pk']) % 4))
+
             # Ephemeral key for ECDH (ECIES)
             eph_sk = SigningKey.generate(curve=SECP256k1)
             eph_pk = eph_sk.get_verifying_key()
-            # ECDH
+
+            from ecdsa.ecdh import ECDH
             ecdh = ECDH(curve=SECP256k1, private_key=eph_sk)
             ecdh.load_received_public_key_bytes(recipient_pk_bytes)
             shared_secret = ecdh.generate_sharedsecret_bytes()
+
             aes_key = hkdf(shared_secret)
             aesgcm = AESGCM(aes_key)
             nonce = os.urandom(12)
             ct = aesgcm.encrypt(nonce, original_bytes, None)
 
-            # --- RLP ENVELOPE ---
-            sender_alg = None
-            sender_pk_bytes = None
-            sender_sig_bytes = None
+            # ---- Build base envelope (indexes 0..8) ----
+            envelope_base = [
+                1,                              # version            (0)
+                b"secp256k1",                   # alg                (1)
+                compress_pubkey(eph_pk),        # eph_pk             (2)
+                b"aes256gcm",                   # enc                (3)
+                nonce,                          # nonce              (4)
+                ct,                             # ct                 (5)
+                usr.encode(),                   # usr                (6)
+                key_id.encode(),                # id                 (7)
+                iss.encode(),                   # iss                (8)
+            ]
 
-            envelope = [
-                1,                          # version
-                b"secp256k1",               # alg
-                compress_pubkey(eph_pk),    # ephemeral public key
-                b"aes256gcm",               # enc
-                nonce,                      # nonce
-                ct,                         # ciphertext in bytes (encrypted payload)
-                usr.encode() if usr else b"",           # usr (recipient identifier)
-                key_id.encode() if key_id else b"",  # id (recipient key fingerprint)
-                iss.encode() if iss else b"",           # iss (issuer/provider)
-                sender_alg.encode() if sender_alg else b"",
-                sender_pk_bytes if sender_pk_bytes else b"",
-                sender_sig_bytes if sender_sig_bytes else b"",
+            # ---- Optional sender fields ----
+            sender_sig_bytes = b""
+            if sender_sk:
+                # Sign the RLP of the base envelope
+                to_sign = rlp.encode(envelope_base)
+                # Deterministic RFC6979 signature over SHA256 hash (or raw); pick one and stick with it.
+                digest = hashlib.sha256(to_sign).digest()
+
+               # 64-byte (r||s) signature:
+                sender_sig_bytes = sender_sk.sign_deterministic(
+                    digest,
+                    hashfunc=hashlib.sha256,
+                    sigencode=sigencode_string  # returns raw 64 bytes
+                )
+
+                if len(sender_sig_bytes) != 64:
+                    raise ValueError("signature must be 64 bytes (r||s).")
+
+            # Compose final envelope (fixed order!)
+            envelope = envelope_base + [
+                sender_alg_bytes if sender_sk else b"",  # sender_alg        (9)
+                sender_pk_bytes if sender_sk else b"",   # sender_pk         (10)
+                sender_sig_bytes if sender_sk else b"",  # sender_sig        (11)
             ]
 
             rlp_bytes = rlp.encode(envelope)
@@ -236,7 +282,7 @@ def encrypt(email_file):
             # Subject prefix
             subject_with_enc = subject if subject.strip().startswith(SUBJECT_PREFIX) else f"{SUBJECT_PREFIX} {subject}"
 
-            # Build email with instructions and rlp attachment
+            # Build email with instructions and RLP attachment
             outmsg = EmailMessage()
             outmsg['To'] = rcpt
             outmsg['Subject'] = subject_with_enc
@@ -270,11 +316,15 @@ def decrypt(priv, infile, out):
     Decrypt an ECIES-encrypted .eml message file (with RLP attachment)
     and write the original (fully restored) email to file,
     with SUBJECT_PREFIX removed from Subject if present.
+    Also verifies optional sender signature if present.
     """
+
+    # ---- Load recipient private key ----
     with open(priv, "rb") as f:
         sk_bytes = f.read()
     sk = SigningKey.from_string(sk_bytes, curve=SECP256k1)
 
+    # ---- Load the encrypted email ----
     with open(infile, "r") as f:
         raw_email = f.read()
 
@@ -284,69 +334,128 @@ def decrypt(priv, infile, out):
         click.echo("Error: This message does not appear to be Mailnite-encrypted.")
         return
 
-    # --- Find the RLP envelope as the first attachment (regardless of filename) ---
+    # ---- Extract the RLP attachment (first attachment, or prefer application/x-mailnite-enc) ----
     rlp_bytes = None
+    chosen_part = None
     for part in msg.iter_attachments():
-        if part.get_content_type() == 'application/x-mailnite-enc':
-            payload = part.get_content()
-            if isinstance(payload, str):
-                rlp_bytes = payload.encode('latin1')
-            else:
-                rlp_bytes = payload
-            break  # Stop after finding the first matching attachment
+        payload = part.get_content()
+        if isinstance(payload, str):
+            payload = payload.encode('latin1')
+        # Prefer our custom content-type, but accept first if not set
+        if part.get_content_type() == 'application/x-mailnite-enc' or chosen_part is None:
+            rlp_bytes = payload
+            chosen_part = part
+            if part.get_content_type() == 'application/x-mailnite-enc':
+                break  # good enough, stop here
+
     if not rlp_bytes:
-        click.echo("Error: No attachment with content-type 'application/x-mailnite-enc' found!")
+        click.echo("Error: No RLP envelope attachment found!")
         return
 
-    # --- RLP DECODE ---
-    decoded = rlp.decode(rlp_bytes)
+    # ---- Decode RLP ----
+    try:
+        decoded = rlp.decode(rlp_bytes)
+    except rlp.DecodingError as e:
+        click.echo(f"Error: Invalid RLP envelope ({e})")
+        return
 
-    if len(decoded) < 6:
-        raise ValueError("Invalid envelope: must contain at least 6 fields.")
+    # Basic length check (we need at least up to ct)
+    if len(decoded) < 9:  # up to 'iss' is index 8
+        click.echo("Error: Envelope too short; missing required fields.")
+        return
 
-    version = int.from_bytes(decoded[0], byteorder='big') if isinstance(decoded[0], bytes) else decoded[0]
+    # Helper to get int regardless of rlp encoding
+    def to_int(x):
+        return x if isinstance(x, int) else int.from_bytes(x, 'big') if isinstance(x, (bytes, bytearray)) else int(x)
 
+    # ---- Fixed-order extraction ----
+    # 0..8 are required in your current schema
+    version      = to_int(decoded[0])
+    alg_bytes    = decoded[1]
+    eph_pk_bytes = decoded[2]
+    enc_bytes    = decoded[3]
+    nonce        = decoded[4]
+    ct           = decoded[5]
+    usr_bytes    = decoded[6]
+    id_bytes     = decoded[7]
+    iss_bytes    = decoded[8]
+
+    # Optional indices (might be missing or empty)
+    sender_alg_bytes = decoded[9]  if len(decoded) > 9  else b""
+    sender_pk_bytes  = decoded[10] if len(decoded) > 10 else b""
+    sender_sig_bytes = decoded[11] if len(decoded) > 11 else b""
+
+    # ---- Validate required fields ----
     if version != 1:
-        click.echo(f"Error: Invalid Envelop version '{version}'!")
+        click.echo(f"Error: Unsupported envelope version '{version}'!")
         return
 
-    alg           = decoded[1].decode(errors='replace')
-    eph_pk_bytes  = decoded[2]
-    enc           = decoded[3].decode(errors='replace')
-    nonce         = decoded[4]
-    ct            = decoded[5]
-
+    alg = alg_bytes.decode(errors='replace')
     if alg != "secp256k1":
-        click.echo(f"Error: Invalid ECIES algorithm '{alg}'!")
+        click.echo(f"Error: Unsupported ECIES algorithm '{alg}'!")
         return
 
+    enc = enc_bytes.decode(errors='replace')
     if enc != "aes256gcm":
-        click.echo(f"Error: Invalid encryption algorithm '{enc}'!")
+        click.echo(f"Error: Unsupported encryption algorithm '{enc}'!")
         return
 
-    # ECIES decryption
+    # ---- ECIES decryption ----
     ecdh = ECDH(curve=SECP256k1, private_key=sk)
     ecdh.load_received_public_key_bytes(eph_pk_bytes)
     shared_secret = ecdh.generate_sharedsecret_bytes()
     aes_key = hkdf(shared_secret)
     aesgcm = AESGCM(aes_key)
-    pt = aesgcm.decrypt(nonce, ct, None)
 
-    # The decrypted payload is the full, original email (including all attachments)
-    # Remove SUBJECT_PREFIX from Subject if present
+    try:
+        pt = aesgcm.decrypt(nonce, ct, None)
+    except Exception as e:
+        click.echo(f"Error: Decryption failed ({e})")
+        return
+
+    # ---- Optional sender signature verification ----
+    # Only verify if both sender_pk and sender_sig are present (non-empty)
+    if sender_pk_bytes and sender_sig_bytes:
+        sender_alg = sender_alg_bytes.decode(errors='replace') if sender_alg_bytes else "secp256k1"
+        if sender_alg != "secp256k1":
+            click.echo(f"Warning: Sender algorithm '{sender_alg}' not supported. Skipping signature verification.")
+        else:
+            try:
+                # Re-encode ONLY the fields that were signed (0..8)
+                base_envelope = decoded[:9]
+                to_verify = rlp.encode(base_envelope)
+                digest = hashlib.sha256(to_verify).digest()
+
+                vk = VerifyingKey.from_string(sender_pk_bytes, curve=SECP256k1)
+                # 64-byte raw (r||s) signature
+                if len(sender_sig_bytes) != 64:
+                    raise ValueError("sender_sig is not 64 bytes (r||s).")
+
+                vk.verify(sender_sig_bytes, digest,
+                          hashfunc=hashlib.sha256,
+                          sigdecode=sigdecode_string)
+                click.echo("Sender signature verified successfully.")
+            except Exception as e:
+                click.echo(f"Warning: Sender signature verification failed ({e}).")
+
+    # ---- Restore original email ----
     orig_msg = email.message_from_bytes(pt, policy=policy.default)
     subject = orig_msg.get('Subject', '')
 
-    # Remove prefix if present (case sensitive, as you defined)
     if subject.startswith(SUBJECT_PREFIX):
         new_subject = subject[len(SUBJECT_PREFIX):].lstrip()
         orig_msg.replace_header('Subject', new_subject)
 
-    # Save result (preserves all other headers and attachments)
+    # Clear marker header if you don't want to keep it
+    if orig_msg.get('X-Mailnite-Encrypted'):
+        del orig_msg['X-Mailnite-Encrypted']
+
+    # ---- Save the result ----
     with open(out, "w") as f:
         f.write(orig_msg.as_string(policy=policy.default))
 
     click.echo(f"Decrypted email written to {out}")
+
 
 
 if __name__ == "__main__":
