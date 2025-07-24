@@ -31,7 +31,7 @@ plain.eml.encrypted.alice_at_mailnite.com.eml
 4. Decrypt the email
 
 ```
-python3 mailnite.py decrypt --in=plain.eml.encrypted.alice_at_mailnite.com.eml --out=plain2.eml --priv=alice.mailnite.com.key
+python3 mailnite.py decrypt --in=plain.eml.encrypted.alice_at_mailnite.com.eml --out=plain2.eml --key=alice.mailnite.com.key
 ```
 
 You should get `plain2.eml` identical to `plain.eml`.

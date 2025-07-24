@@ -29,9 +29,6 @@ and upload attachment: mailnite.enc.
 If you are a developer, see: https://github.com/mailnite/concept"""
 
 
-# Generate a signing key using the SECP256k1 curve
-#eph_sk = SigningKey.generate(curve=SECP256k1)
-
 def b64u(x):
     return base64.urlsafe_b64encode(x).decode().rstrip("=")
 
@@ -169,9 +166,6 @@ def create(out, recipients, subject, body, attachments):
     click.echo(f"Plain email with attachments saved to {out}")
 
 
-
-import rlp
-
 @cli.command()
 @click.option("--in", "email_file", required=True, type=click.Path(exists=True), help="Plain email file")
 def encrypt(email_file):
@@ -253,7 +247,7 @@ def encrypt(email_file):
 
 
 @cli.command()
-@click.option("--priv", required=True, help="Recipient's private key file")
+@click.option("--key", "priv", required=True, help="Recipient's private key file")
 @click.option("--in", "infile", required=True, type=click.Path(exists=True), help="Input encrypted .eml file")
 @click.option("--out", required=True, help="Output file for decrypted plaintext email")
 def decrypt(priv, infile, out):
@@ -278,14 +272,15 @@ def decrypt(priv, infile, out):
     # --- Find the RLP envelope as the first attachment (regardless of filename) ---
     rlp_bytes = None
     for part in msg.iter_attachments():
-        payload = part.get_content()
-        if isinstance(payload, str):
-            rlp_bytes = payload.encode('latin1')
-        else:
-            rlp_bytes = payload
-        break  # Only use the first attachment found
+        if part.get_content_type() == 'application/x-mailnite-enc':
+            payload = part.get_content()
+            if isinstance(payload, str):
+                rlp_bytes = payload.encode('latin1')
+            else:
+                rlp_bytes = payload
+            break  # Stop after finding the first matching attachment
     if not rlp_bytes:
-        click.echo("Error: No RLP envelope attachment found!")
+        click.echo("Error: No attachment with content-type 'application/x-mailnite-enc' found!")
         return
 
     # --- RLP DECODE ---
