@@ -50,14 +50,6 @@ def hkdf(shared_secret, salt=b"mailnite", length=32):
         algorithm=hashes.SHA256(), length=length, salt=salt, info=b"mailnite"
     ).derive(shared_secret)
 
-def extract_recipients(email_txt):
-    # Extract all emails from 'To:' header (RFC822, comma-separated)
-    match = re.search(r'^To:\s*(.+)$', email_txt, re.MULTILINE | re.IGNORECASE)
-    if not match:
-        return []
-    recipients = [r.strip() for r in match.group(1).split(',') if r.strip()]
-    return recipients
-
 @click.group()
 def cli():
     """Mailnite DNS PKI Email PoC CLI"""
@@ -194,6 +186,17 @@ def encrypt(email_file):
         if rec is None:
             click.echo(f"Warning: No DNS public key record found for {rcpt}. Skipping this recipient.")
             continue
+        alg = rec.get("alg")
+        if alg != "secp256k1":
+            click.echo(f"Warning: Unsupported ECIES algorithm '{alg}' in {rcpt}. Skipping this recipient.")
+            continue
+        enc = rec.get("enc", "aes256gcm")
+        if enc != "aes256gcm":
+            click.echo(f"Warning: Unsupported encryption algorithm '{enc}' in {rcpt}. Skipping this recipient.")
+            continue
+        usr = rec.get("usr")
+        key_id = rec.get("id")
+        iss = rec.get("iss")
         try:
             recipient_pk_bytes = base64.urlsafe_b64decode(rec['pk'] + '=' * (-len(rec['pk']) % 4))
             # Ephemeral key for ECDH (ECIES)
@@ -209,13 +212,25 @@ def encrypt(email_file):
             ct = aesgcm.encrypt(nonce, original_bytes, None)
 
             # --- RLP ENVELOPE ---
+            sender_alg = None
+            sender_pk_bytes = None
+            sender_sig_bytes = None
+
             envelope = [
-                1,  # version
-                "ecies-aesgcm",
-                compress_pubkey(eph_pk),
-                nonce,
-                ct,
+                1,                          # version
+                b"secp256k1",               # alg
+                compress_pubkey(eph_pk),    # ephemeral public key
+                b"aes256gcm",               # enc
+                nonce,                      # nonce
+                ct,                         # ciphertext in bytes (encrypted payload)
+                usr.encode() if usr else b"",           # usr (recipient identifier)
+                key_id.encode() if key_id else b"",  # id (recipient key fingerprint)
+                iss.encode() if iss else b"",           # iss (issuer/provider)
+                sender_alg.encode() if sender_alg else b"",
+                sender_pk_bytes if sender_pk_bytes else b"",
+                sender_sig_bytes if sender_sig_bytes else b"",
             ]
+
             rlp_bytes = rlp.encode(envelope)
 
             # Subject prefix
@@ -284,8 +299,30 @@ def decrypt(priv, infile, out):
         return
 
     # --- RLP DECODE ---
-    envelope = rlp.decode(rlp_bytes)
-    version, alg, eph_pk_bytes, nonce, ct = envelope
+    decoded = rlp.decode(rlp_bytes)
+
+    if len(decoded) < 6:
+        raise ValueError("Invalid envelope: must contain at least 6 fields.")
+
+    version = int.from_bytes(decoded[0], byteorder='big') if isinstance(decoded[0], bytes) else decoded[0]
+
+    if version != 1:
+        click.echo(f"Error: Invalid Envelop version '{version}'!")
+        return
+
+    alg           = decoded[1].decode(errors='replace')
+    eph_pk_bytes  = decoded[2]
+    enc           = decoded[3].decode(errors='replace')
+    nonce         = decoded[4]
+    ct            = decoded[5]
+
+    if alg != "secp256k1":
+        click.echo(f"Error: Invalid ECIES algorithm '{alg}'!")
+        return
+
+    if enc != "aes256gcm":
+        click.echo(f"Error: Invalid encryption algorithm '{enc}'!")
+        return
 
     # ECIES decryption
     ecdh = ECDH(curve=SECP256k1, private_key=sk)
