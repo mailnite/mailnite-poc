@@ -1,2 +1,2 @@
-# poc
+# mailnite-poc
 Proof of Concept
